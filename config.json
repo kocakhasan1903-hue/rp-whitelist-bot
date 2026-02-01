@@ -2,6 +2,12 @@
   "verify_channel_id": "1467331384522702848",
   "log_channel_id": "1467331987164627066",
   "auto_role_name": "Einreise",
-  "embed_title": "Whitelist / Einreise",
-  "embed_text": "Klicke auf **Registrieren**, gib deine IC-Daten ein und wähle deine Familie."
+
+  "embed_title": "Rollenvergabe",
+  "embed_text": "Klicke auf **Rollenvergabe starten**, wähle deine Familie und gib deine IC-Daten ein.",
+
+  "staff_role_ids": [
+    "1464242153818558630",
+    "1464242153965486102"
+  ]
 }
