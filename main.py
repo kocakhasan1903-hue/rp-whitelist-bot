@@ -5,7 +5,6 @@ import time
 import requests
 import discord
 from discord.ext import commands
-from discord import app_commands
 from dotenv import load_dotenv
 
 # ===================== ENV =====================
@@ -37,8 +36,7 @@ EMBED_TITLE = CONFIG["embed_title"]
 EMBED_TEXT = CONFIG["embed_text"]
 STAFF_ROLE_IDS = set(int(x) for x in CONFIG["staff_role_ids"])
 
-
-# ===================== GitHub Storage (families.json) =====================
+# ===================== GitHub Storage =====================
 API_BASE = "https://api.github.com"
 OWNER, REPO = GITHUB_REPO.split("/", 1)
 
@@ -51,14 +49,11 @@ def gh_headers():
     }
 
 def gh_get_families():
-    """Return (families_dict, sha or None). Creates empty file if missing."""
     url = f"{API_BASE}/repos/{OWNER}/{REPO}/contents/{GITHUB_FAMILIES_PATH}"
     params = {"ref": GITHUB_BRANCH}
-
     r = requests.get(url, headers=gh_headers(), params=params, timeout=20)
 
     if r.status_code == 404:
-        # Create empty file
         empty = {}
         sha = gh_put_families(empty, sha=None, message="init families.json")
         return empty, sha
@@ -67,6 +62,7 @@ def gh_get_families():
     data = r.json()
     content_b64 = data.get("content", "")
     sha = data.get("sha")
+
     if not content_b64:
         return {}, sha
 
@@ -80,34 +76,25 @@ def gh_get_families():
         return {}, sha
 
 def gh_put_families(families: dict, sha: str | None, message: str):
-    """Write families dict to GitHub. Returns new sha."""
     url = f"{API_BASE}/repos/{OWNER}/{REPO}/contents/{GITHUB_FAMILIES_PATH}"
-
     body = json.dumps(families, indent=2, ensure_ascii=False)
     content_b64 = base64.b64encode(body.encode("utf-8")).decode("ascii")
 
-    payload = {
-        "message": message,
-        "content": content_b64,
-        "branch": GITHUB_BRANCH
-    }
+    payload = {"message": message, "content": content_b64, "branch": GITHUB_BRANCH}
     if sha:
         payload["sha"] = sha
 
     r = requests.put(url, headers=gh_headers(), json=payload, timeout=20)
 
-    # If SHA mismatch due to concurrency, retry once
     if r.status_code == 409:
         time.sleep(0.7)
-        fams_now, sha_now = gh_get_families()
-        # merge strategy: overwrite with our families (staff action wins)
+        _, sha_now = gh_get_families()
         payload["sha"] = sha_now
         r = requests.put(url, headers=gh_headers(), json=payload, timeout=20)
 
     r.raise_for_status()
     return r.json()["content"]["sha"]
 
-# small cache to reduce calls (still correct enough for RP)
 _FAM_CACHE = {"ts": 0, "data": {}, "sha": None}
 CACHE_SECONDS = 5
 
@@ -120,12 +107,9 @@ def load_families():
     return fams
 
 def save_families(families: dict, message: str):
-    # get latest sha (avoid overwriting)
-    fams, sha = gh_get_families()
-    # overwrite with provided families (staff changes are deliberate)
+    _, sha = gh_get_families()
     new_sha = gh_put_families(families, sha=sha, message=message)
     _FAM_CACHE.update({"ts": time.time(), "data": families, "sha": new_sha})
-
 
 # ===================== BOT =====================
 intents = discord.Intents.default()
@@ -143,6 +127,22 @@ async def log(guild: discord.Guild, msg: str):
         except:
             pass
 
+# ===================== Nickname format =====================
+def make_nick(tag: str, first: str, last: str) -> str:
+    # Format: TAG | Vorname Nachname
+    t = (tag or "").strip().upper()
+    f = (first or "").strip()
+    l = (last or "").strip()
+    nick = f"{t} | {f} {l}".strip()
+    return nick[:32]
+
+def get_tag_from_family_data(family_name: str, data: dict) -> str:
+    # fallback: if no tag stored, use family name (first 6 chars upper) or full family name
+    tag = str(data.get("tag", "")).strip()
+    if tag:
+        return tag.upper()
+    # fallback: use family name as tag
+    return family_name.strip().upper()[:6] or "TAG"
 
 # ===================== UI =====================
 def build_embed():
@@ -157,10 +157,6 @@ def build_embed():
     )
     embed.set_footer(text="Sin Nombre • Rollenvergabe System")
     return embed
-
-def nickname_from_inputs(first: str, last: str, family: str) -> str:
-    nick = f"{first.strip()} {last.strip()} | {family.strip()}"
-    return nick[:32]
 
 class VerifyModal(discord.ui.Modal, title="🧬 Rollenvergabe"):
     ic_first = discord.ui.TextInput(label="IC Vorname", max_length=32)
@@ -196,9 +192,10 @@ class VerifyModal(discord.ui.Modal, title="🧬 Rollenvergabe"):
 
         member = interaction.user
 
-        # Nickname setzen
+        # ✅ Nickname: TAG | Vorname Nachname
+        tag = get_tag_from_family_data(self.family_name, data)
         try:
-            await member.edit(nick=nickname_from_inputs(self.ic_first.value, self.ic_last.value, self.family_name))
+            await member.edit(nick=make_nick(tag, self.ic_first.value, self.ic_last.value))
         except:
             pass
 
@@ -212,12 +209,14 @@ class VerifyModal(discord.ui.Modal, title="🧬 Rollenvergabe"):
 
         # alte Familienrollen entfernen
         for fam in families.values():
-            old_role = interaction.guild.get_role(int(fam.get("role_id", 0)))
-            if old_role and old_role in member.roles:
-                try:
-                    await member.remove_roles(old_role)
-                except:
-                    pass
+            rid = str(fam.get("role_id", "")).strip()
+            if rid.isdigit():
+                old_role = interaction.guild.get_role(int(rid))
+                if old_role and old_role in member.roles:
+                    try:
+                        await member.remove_roles(old_role)
+                    except:
+                        pass
 
         # neue Rolle geben
         try:
@@ -229,9 +228,9 @@ class VerifyModal(discord.ui.Modal, title="🧬 Rollenvergabe"):
             )
             return
 
-        await log(interaction.guild, f"✅ Rollenvergabe: {interaction.user} → {role.name} ({self.family_name})")
+        await log(interaction.guild, f"✅ Rollenvergabe: {interaction.user} → {role.name} (TAG {tag})")
         await interaction.response.send_message(
-            f"✅ Erfolgreich!\n🏴 Familie: **{self.family_name}**\n🏷️ Rolle: **{role.name}**",
+            f"✅ Erfolgreich!\n🏷️ Tag: **{tag}**\n🏴 Familie: **{self.family_name}**\n🏷️ Rolle: **{role.name}**",
             ephemeral=True
         )
 
@@ -243,12 +242,7 @@ class FamilySelect(discord.ui.Select):
         else:
             options = [discord.SelectOption(label=name, value=name, emoji="🏴") for name in sorted(fams.keys())[:25]]
 
-        super().__init__(
-            placeholder="🏴 Wähle deine Familie",
-            min_values=1,
-            max_values=1,
-            options=options
-        )
+        super().__init__(placeholder="🏴 Wähle deine Familie", min_values=1, max_values=1, options=options)
 
     async def callback(self, interaction: discord.Interaction):
         if self.values[0] == "none":
@@ -258,19 +252,18 @@ class FamilySelect(discord.ui.Select):
 
 class FamilyView(discord.ui.View):
     def __init__(self):
-        super().__init__(timeout=None)  # ✅ dauerhaft (kein Interaktion-fehlgeschlagen)
+        super().__init__(timeout=None)
         self.add_item(FamilySelect())
 
 class StartView(discord.ui.View):
     def __init__(self):
-        super().__init__(timeout=None)  # ✅ dauerhaft
+        super().__init__(timeout=None)
 
     @discord.ui.button(label="Rollenvergabe starten", style=discord.ButtonStyle.danger, emoji="🧬", custom_id="start_roles_button")
     async def start(self, interaction: discord.Interaction, _):
         await interaction.response.send_message("👇 Familie auswählen:", ephemeral=True, view=FamilyView())
 
 async def ensure_ui_message(channel: discord.TextChannel) -> discord.Message:
-    # findet vorhandene Bot-UI Nachricht und updated sie, sonst postet neu
     async for msg in channel.history(limit=50):
         if msg.author.id == bot.user.id and msg.embeds:
             if msg.embeds[0].title and EMBED_TITLE.lower() in msg.embeds[0].title.lower():
@@ -278,26 +271,25 @@ async def ensure_ui_message(channel: discord.TextChannel) -> discord.Message:
                 return msg
     return await channel.send(embed=build_embed(), view=StartView())
 
-
 # ===================== STAFF COMMANDS =====================
-@bot.tree.command(name="familie_add", description="Familie anlegen (Staff)")
-async def familie_add(interaction: discord.Interaction, name: str, passwort: str, rolle: discord.Role):
+@bot.tree.command(name="familie_add", description="Familie anlegen (Staff) - mit Tag/Abkürzung")
+async def familie_add(interaction: discord.Interaction, name: str, tag: str, passwort: str, rolle: discord.Role):
     if not is_staff(interaction.user):
         await interaction.response.send_message("❌ Keine Berechtigung.", ephemeral=True)
         return
 
     fams = load_families()
     name = name.strip()
-    fams[name] = {"password": passwort.strip(), "role_id": str(rolle.id)}
-    save_families(fams, message=f"familie_add: {name}")
+    tag = tag.strip().upper()
+    fams[name] = {"password": passwort.strip(), "role_id": str(rolle.id), "tag": tag}
+    save_families(fams, message=f"familie_add: {name} ({tag})")
 
-    # UI automatisch refresh
     ch = interaction.guild.get_channel(VERIFY_CHANNEL_ID)
     if ch:
         await ensure_ui_message(ch)
 
-    await log(interaction.guild, f"🛠️ familie_add: {interaction.user} → {name} = {rolle.name}")
-    await interaction.response.send_message(f"✅ Familie **{name}** gespeichert → {rolle.mention}", ephemeral=True)
+    await log(interaction.guild, f"🛠️ familie_add: {interaction.user} → {name} (TAG {tag}) = {rolle.name}")
+    await interaction.response.send_message(f"✅ Familie **{name}** (Tag **{tag}**) gespeichert → {rolle.mention}", ephemeral=True)
 
 @bot.tree.command(name="familie_remove", description="Familie löschen (Staff)")
 async def familie_remove(interaction: discord.Interaction, name: str):
@@ -332,8 +324,12 @@ async def familien_liste(interaction: discord.Interaction):
         await interaction.response.send_message("ℹ️ Keine Familien vorhanden.", ephemeral=True)
         return
 
-    txt = "\n".join([f"🏴 **{k}**" for k in sorted(fams.keys())])
-    await interaction.response.send_message(txt, ephemeral=True)
+    lines = []
+    for k in sorted(fams.keys()):
+        tag = str(fams[k].get("tag", "")).strip().upper()
+        rid = str(fams[k].get("role_id", "")).strip()
+        lines.append(f"🏴 **{k}** — Tag: **{tag or '-'}** — RoleID: `{rid}`")
+    await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
 @bot.tree.command(name="familie_change", description="Familie eines Users ändern + Nickname anpassen (Staff)")
 async def familie_change(interaction: discord.Interaction, user: discord.Member, familie: str):
@@ -354,29 +350,33 @@ async def familie_change(interaction: discord.Interaction, user: discord.Member,
 
     # entferne alle anderen Familienrollen
     for data in fams.values():
-        old_role = interaction.guild.get_role(int(data["role_id"]))
-        if old_role and old_role in user.roles:
-            try:
-                await user.remove_roles(old_role)
-            except:
-                pass
+        rid = str(data.get("role_id", "")).strip()
+        if rid.isdigit():
+            old_role = interaction.guild.get_role(int(rid))
+            if old_role and old_role in user.roles:
+                try:
+                    await user.remove_roles(old_role)
+                except:
+                    pass
 
-    # gebe neue Rolle
     try:
         await user.add_roles(role)
     except:
         await interaction.response.send_message("❌ Rolle konnte nicht vergeben werden (Hierarchie prüfen).", ephemeral=True)
         return
 
-    # Nickname anpassen: "vorheriger name | neue familie"
-    base = (user.nick or user.name).split("|")[0].strip()
+    # Nickname: TAG | Vorname Nachname (nimmt vorhandenen Namen rechts vom |)
+    tag = str(fams[familie].get("tag", familie)).strip().upper()
+    right = (user.nick or user.name)
+    if "|" in right:
+        right = right.split("|", 1)[1].strip()  # alles nach dem Tag behalten
     try:
-        await user.edit(nick=f"{base} | {familie}"[:32])
+        await user.edit(nick=f"{tag} | {right}"[:32])
     except:
         pass
 
-    await log(interaction.guild, f"🔄 familie_change: {interaction.user} → {user} => {familie}")
-    await interaction.response.send_message(f"✅ {user.mention} ist jetzt **{familie}**.", ephemeral=True)
+    await log(interaction.guild, f"🔄 familie_change: {interaction.user} → {user} => {familie} (TAG {tag})")
+    await interaction.response.send_message(f"✅ {user.mention} ist jetzt **{familie}** (Tag **{tag}**).", ephemeral=True)
 
 @bot.tree.command(name="ui_update", description="UI neu posten/aktualisieren (Staff)")
 async def ui_update(interaction: discord.Interaction):
@@ -392,11 +392,9 @@ async def ui_update(interaction: discord.Interaction):
     msg = await ensure_ui_message(ch)
     await interaction.response.send_message(f"✅ UI aktualisiert: {msg.jump_url}", ephemeral=True)
 
-
 # ===================== EVENTS =====================
 @bot.event
 async def setup_hook():
-    # Commands global (überall sichtbar, kann bei Discord manchmal etwas dauern)
     await bot.tree.sync()
     print("🌍 Slash Commands GLOBAL synced")
     print("🌳 Commands:", [c.name for c in bot.tree.get_commands()])
@@ -404,8 +402,6 @@ async def setup_hook():
 @bot.event
 async def on_ready():
     print(f"✅ Online als {bot.user}")
-
-    # UI automatisch updaten (damit UI nach Neustart immer funktioniert)
     for g in bot.guilds:
         ch = g.get_channel(VERIFY_CHANNEL_ID)
         if ch:
@@ -417,7 +413,6 @@ async def on_ready():
 
 @bot.event
 async def on_member_join(member: discord.Member):
-    # Einreise Rolle automatisch geben
     role = discord.utils.get(member.guild.roles, name=AUTO_ROLE_NAME)
     if role:
         try:
