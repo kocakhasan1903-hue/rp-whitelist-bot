@@ -1,5 +1,6 @@
 import os
 import json
+import time
 import discord
 from discord.ext import commands
 from discord import app_commands
@@ -10,12 +11,15 @@ load_dotenv()
 TOKEN = (os.getenv("DISCORD_TOKEN") or "").strip()
 
 _guild_env = (os.getenv("GUILD_ID") or "").strip()
-GUILD_ID = int(_guild_env) if _guild_env.isdigit() else None  # optional, aber empfohlen
+GUILD_ID = int(_guild_env) if _guild_env.isdigit() else None  # empfohlen!
 
-# ------------------ FILES ------------------
 CONFIG_FILE = "config.json"
 FAMILIES_FILE = "families.json"
 
+MODAL_TITLE = "Rollenvergabe - LSD Sin Nombre"
+
+
+# ------------------ HELPERS ------------------
 def fatal(msg: str):
     raise SystemExit(f"❌ {msg}")
 
@@ -30,28 +34,40 @@ def save_json(path: str, data):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
 
-# ------------------ VALIDATION ------------------
+def load_families() -> dict:
+    """
+    families.json:
+    {
+      "Mafia": {"password":"pw", "role_id":"123"},
+      "Gang":  {"password":"pw", "role_id":"456"}
+    }
+    """
+    return load_json(FAMILIES_FILE, {})
+
+def save_families(data: dict):
+    save_json(FAMILIES_FILE, data)
+
+
+# ------------------ CONFIG ------------------
 if not TOKEN:
-    fatal("DISCORD_TOKEN fehlt. Bitte im Hoster als Environment Variable setzen.")
+    fatal("DISCORD_TOKEN fehlt (Railway Variable).")
 
 CONFIG = load_json(CONFIG_FILE, {})
+for k in ["verify_channel_id", "auto_role_name", "embed_title", "embed_text"]:
+    if not str(CONFIG.get(k, "")).strip():
+        fatal(f"config.json fehlt: {k}")
 
-required = ["verify_channel_id", "auto_role_name", "embed_title", "embed_text"]
-missing = [k for k in required if not str(CONFIG.get(k, "")).strip()]
-if missing:
-    fatal(f"config.json fehlt: {', '.join(missing)}")
-
-verify_channel_id_str = str(CONFIG["verify_channel_id"]).strip()
-if not verify_channel_id_str.isdigit():
-    fatal("config.json: verify_channel_id muss eine Zahl (Channel-ID) sein.")
-VERIFY_CHANNEL_ID = int(verify_channel_id_str)
+verify_id_str = str(CONFIG["verify_channel_id"]).strip()
+if not verify_id_str.isdigit():
+    fatal("verify_channel_id muss eine Zahl sein.")
+VERIFY_CHANNEL_ID = int(verify_id_str)
 
 AUTO_ROLE_NAME = str(CONFIG["auto_role_name"]).strip()
 EMBED_TITLE = str(CONFIG["embed_title"]).strip()
 EMBED_TEXT = str(CONFIG["embed_text"]).strip()
 
-log_channel_id_str = str(CONFIG.get("log_channel_id", "")).strip()
-LOG_CHANNEL_ID = int(log_channel_id_str) if log_channel_id_str.isdigit() else None
+log_id_str = str(CONFIG.get("log_channel_id", "")).strip()
+LOG_CHANNEL_ID = int(log_id_str) if log_id_str.isdigit() else None
 
 STAFF_ROLE_IDS = set()
 for rid in CONFIG.get("staff_role_ids", []):
@@ -59,28 +75,13 @@ for rid in CONFIG.get("staff_role_ids", []):
     if rid_s.isdigit():
         STAFF_ROLE_IDS.add(int(rid_s))
 
-MODAL_TITLE = "Rollenvergabe - LSD Sin Nombre"
 
-# ------------------ STORAGE ------------------
-def load_families():
-    """
-    families.json Format:
-    {
-      "Familienname": {"password": "...", "role_id": "123..."},
-      ...
-    }
-    """
-    return load_json(FAMILIES_FILE, {})
-
-def save_families(data):
-    save_json(FAMILIES_FILE, data)
-
-# ------------------ BOT SETUP ------------------
+# ------------------ BOT ------------------
 intents = discord.Intents.default()
-intents.members = True  # Developer Portal: Server Members Intent aktivieren!
+intents.members = True  # Developer Portal: Server Members Intent ON
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# ------------------ HELPERS ------------------
+
 async def log(guild: discord.Guild, text: str):
     if not LOG_CHANNEL_ID:
         return
@@ -92,48 +93,21 @@ async def log(guild: discord.Guild, text: str):
             pass
 
 def can_manage(interaction: discord.Interaction) -> bool:
-    """Wer darf /family verwalten? Admin ODER eine der staff_role_ids."""
+    # Admin immer erlaubt
     if interaction.user.guild_permissions.administrator:
         return True
-    if STAFF_ROLE_IDS:
-        member = interaction.user
-        # interaction.user ist in Guild-Interaktionen ein Member-Objekt
-        for r in getattr(member, "roles", []):
-            if r.id in STAFF_ROLE_IDS:
-                return True
+    # Oder Staff-Rollen
+    member = interaction.user
+    for r in getattr(member, "roles", []):
+        if r.id in STAFF_ROLE_IDS:
+            return True
     return False
 
-def build_family_options(families: dict) -> list[discord.SelectOption]:
-    # Discord erlaubt max 25 Optionen im Select
-    names = sorted(list(families.keys()))[:25]
+
+# ------------------ UI ------------------
+def family_options(families: dict):
+    names = sorted(list(families.keys()))[:25]  # Discord Limit
     return [discord.SelectOption(label=n, value=n) for n in names]
-
-# ------------------ UI FLOW ------------------
-class FamilySelect(discord.ui.Select):
-    def __init__(self, families: dict):
-        super().__init__(
-            placeholder="Wähle deine Familie",
-            min_values=1,
-            max_values=1,
-            options=build_family_options(families),
-            custom_id="family_select_ui"
-        )
-
-    async def callback(self, interaction: discord.Interaction):
-        families = load_families()
-        fam = self.values[0]
-        if fam not in families:
-            await interaction.response.send_message("❌ Familie nicht gefunden.", ephemeral=True)
-            return
-
-        # Nach Auswahl: Modal öffnen
-        await interaction.response.send_modal(VerifyModal(family_name=fam))
-
-class FamilySelectView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=300)
-        families = load_families()
-        self.add_item(FamilySelect(families))
 
 class VerifyModal(discord.ui.Modal):
     def __init__(self, family_name: str):
@@ -151,14 +125,12 @@ class VerifyModal(discord.ui.Modal):
     async def on_submit(self, interaction: discord.Interaction):
         families = load_families()
         entry = families.get(self.family_name)
-
         if not entry:
-            await interaction.response.send_message("❌ Familie existiert nicht (mehr).", ephemeral=True)
+            await interaction.response.send_message("❌ Familie nicht gefunden.", ephemeral=True)
             return
 
-        pw_ok = (self.password.value.strip() == str(entry.get("password", "")))
-        if not pw_ok:
-            await log(interaction.guild, f"🚫 Passwort FAIL: {interaction.user} → {self.family_name}")
+        if self.password.value.strip() != str(entry.get("password", "")):
+            await log(interaction.guild, f"🚫 PASS FAIL: {interaction.user} → {self.family_name}")
             await interaction.response.send_message("❌ Passwort ist falsch.", ephemeral=True)
             return
 
@@ -169,7 +141,7 @@ class VerifyModal(discord.ui.Modal):
 
         role_id = str(entry.get("role_id", "")).strip()
         if not role_id.isdigit():
-            await interaction.response.send_message("❌ Rolle ungültig (role_id).", ephemeral=True)
+            await interaction.response.send_message("❌ role_id ungültig.", ephemeral=True)
             return
 
         role = interaction.guild.get_role(int(role_id))
@@ -178,9 +150,9 @@ class VerifyModal(discord.ui.Modal):
             return
 
         # Nickname setzen (optional)
-        nick = f"{self.first.value.strip()} {self.last.value.strip()}"[:32]
+        nickname = f"{self.first.value.strip()} {self.last.value.strip()}"[:32]
         try:
-            await member.edit(nick=nick)
+            await member.edit(nick=nickname)
         except:
             pass
 
@@ -197,38 +169,63 @@ class VerifyModal(discord.ui.Modal):
             await member.add_roles(role)
         except:
             await interaction.response.send_message(
-                "❌ Konnte Rolle nicht geben. Prüfe Rollen-Hierarchie & Manage Roles.",
+                "❌ Rolle konnte nicht vergeben werden. Prüfe Rollen-Hierarchie & 'Manage Roles'.",
                 ephemeral=True
             )
             return
 
-        await log(interaction.guild, f"✅ Rollenvergabe OK: {interaction.user} → {self.family_name} ({role.name})")
+        await log(interaction.guild, f"✅ OK: {interaction.user} → {self.family_name} ({role.name})")
         await interaction.response.send_message(
-            f"✅ Erfolgreich! Willkommen **{nick}**.\nDu hast die Rolle **{role.name}** erhalten.",
+            f"✅ Erfolgreich! Willkommen **{nickname}**.\nRolle: **{role.name}**",
             ephemeral=True
         )
+
+class FamilySelect(discord.ui.Select):
+    def __init__(self):
+        families = load_families()
+        super().__init__(
+            placeholder="Wähle deine Familie",
+            min_values=1,
+            max_values=1,
+            options=family_options(families),
+            custom_id="roles_family_select_v1"
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        families = load_families()
+        fam = self.values[0]
+        if fam not in families:
+            await interaction.response.send_message("❌ Familie nicht gefunden.", ephemeral=True)
+            return
+        await interaction.response.send_modal(VerifyModal(family_name=fam))
+
+class FamilySelectView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=300)
+        self.add_item(FamilySelect())
 
 class StartView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.button(label="Rollenvergabe starten", style=discord.ButtonStyle.success, custom_id="start_roles_ui")
+    @discord.ui.button(label="Rollenvergabe starten", style=discord.ButtonStyle.success, custom_id="roles_start_v1")
     async def start(self, interaction: discord.Interaction, _):
         families = load_families()
         if not families:
             await interaction.response.send_message(
-                "⚠️ Es sind noch keine Familien angelegt. Ein Teammitglied muss zuerst `/family add` nutzen.",
+                "⚠️ Es gibt noch keine Familien. Staff muss zuerst `/family add` nutzen.",
                 ephemeral=True
             )
             return
         await interaction.response.send_message(
             "Bitte wähle deine **Familie**:",
-            view=FamilySelectView(),
-            ephemeral=True
+            ephemeral=True,
+            view=FamilySelectView()
         )
 
-# ------------------ ADMIN SLASH COMMANDS ------------------
-family_group = app_commands.Group(name="family", description="Familienverwaltung (Rollenvergabe)")
+
+# ------------------ SLASH COMMANDS ------------------
+family_group = app_commands.Group(name="family", description="Familienverwaltung (Staff)")
 
 @family_group.command(name="add", description="Familie hinzufügen/aktualisieren")
 @app_commands.describe(familie="Familienname", passwort="Familienpasswort", rolle="Rolle die vergeben wird")
@@ -244,7 +241,7 @@ async def family_add(interaction: discord.Interaction, familie: str, passwort: s
     fams[familie] = {"password": passwort, "role_id": str(rolle.id)}
     save_families(fams)
 
-    await log(interaction.guild, f"🛠️ FAMILY ADD by {interaction.user}: {familie} → {rolle.name}")
+    await log(interaction.guild, f"🛠️ FAMILY ADD: {interaction.user} → {familie} = {rolle.name}")
     await interaction.response.send_message(f"✅ Familie **{familie}** gespeichert → {rolle.mention}", ephemeral=True)
 
 @family_group.command(name="remove", description="Familie entfernen")
@@ -256,7 +253,6 @@ async def family_remove(interaction: discord.Interaction, familie: str):
 
     fams = load_families()
     familie = familie.strip()
-
     if familie not in fams:
         await interaction.response.send_message("❌ Familie nicht gefunden.", ephemeral=True)
         return
@@ -264,7 +260,7 @@ async def family_remove(interaction: discord.Interaction, familie: str):
     del fams[familie]
     save_families(fams)
 
-    await log(interaction.guild, f"🛠️ FAMILY REMOVE by {interaction.user}: {familie}")
+    await log(interaction.guild, f"🛠️ FAMILY REMOVE: {interaction.user} → {familie}")
     await interaction.response.send_message(f"✅ Familie **{familie}** entfernt.", ephemeral=True)
 
 @family_group.command(name="list", description="Familien anzeigen")
@@ -281,24 +277,26 @@ async def family_list(interaction: discord.Interaction):
     lines = [f"• **{k}** → <@&{v.get('role_id','?')}>" for k, v in fams.items()]
     await interaction.response.send_message("📜 Familien:\n" + "\n".join(lines), ephemeral=True)
 
+
+# WICHTIG: Hier wird die Gruppe wirklich registriert!
 bot.tree.add_command(family_group)
+
 
 # ------------------ EVENTS ------------------
 @bot.event
 async def on_ready():
     print(f"✅ Online als {bot.user}")
-    bot.add_view(StartView())  # persistent button
+    bot.add_view(StartView())  # persistent UI nach Neustart
 
-    # UI-Nachricht im Verify-Channel sicherstellen
+    # UI-Nachricht im Verify-Channel posten (nur wenn keine existiert)
     for guild in bot.guilds:
         ch = guild.get_channel(VERIFY_CHANNEL_ID)
         if not ch:
             continue
 
-        # Postet nur, wenn noch keine Bot-UI existiert
         found = False
         try:
-            async for msg in ch.history(limit=30):
+            async for msg in ch.history(limit=50):
                 if msg.author.id == bot.user.id and msg.components:
                     found = True
                     break
@@ -324,13 +322,14 @@ async def on_member_join(member: discord.Member):
 
 @bot.event
 async def setup_hook():
-    # Commands sync: mit GUILD_ID sofort, sonst global (kann dauern)
+    # Slash-Commands sync (entscheidend!)
     if GUILD_ID:
         await bot.tree.sync(guild=discord.Object(id=GUILD_ID))
         print(f"✅ Slash Commands synced to guild {GUILD_ID}")
     else:
         await bot.tree.sync()
         print("✅ Slash Commands synced globally (kann dauern)")
+
 
 # ------------------ START ------------------
 bot.run(TOKEN)
