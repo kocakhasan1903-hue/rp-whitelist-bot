@@ -8,7 +8,6 @@ from dotenv import load_dotenv
 # ================= ENV =================
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
-GUILD_ID = int(os.getenv("GUILD_ID"))
 
 # ================= FILES =================
 CONFIG_FILE = "config.json"
@@ -28,6 +27,7 @@ STAFF_ROLE_IDS = set(int(x) for x in CONFIG["staff_role_ids"])
 # ================= BOT =================
 intents = discord.Intents.default()
 intents.members = True
+
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # ================= HELPERS =================
@@ -55,7 +55,7 @@ async def log(guild, msg):
 class VerifyModal(discord.ui.Modal, title="🧬 Identitätsprüfung"):
     ic_first = discord.ui.TextInput(label="IC Vorname")
     ic_last = discord.ui.TextInput(label="IC Nachname")
-    password = discord.ui.TextInput(label="Familienpasswort", style=discord.TextStyle.short)
+    password = discord.ui.TextInput(label="Familienpasswort")
 
     def __init__(self, family):
         super().__init__()
@@ -197,9 +197,8 @@ async def setup_ui(interaction: discord.Interaction):
 # ================= EVENTS =================
 @bot.event
 async def setup_hook():
-    guild = discord.Object(id=GUILD_ID)
-    await bot.tree.sync(guild=guild)
-    print(f"✅ Slash Commands synced to guild {GUILD_ID}")
+    await bot.tree.sync()  # 🌍 GLOBAL
+    print("🌍 Slash Commands GLOBAL synced")
     print("🌳 Commands:", [c.name for c in bot.tree.get_commands()])
 
 @bot.event
