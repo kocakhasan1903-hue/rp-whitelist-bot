@@ -35,6 +35,7 @@ AUTO_ROLE_NAME = CONFIG["auto_role_name"]
 EMBED_TITLE = CONFIG["embed_title"]
 EMBED_TEXT = CONFIG["embed_text"]
 STAFF_ROLE_IDS = set(int(x) for x in CONFIG["staff_role_ids"])
+PASSWORD_CHANNEL_ID = int(CONFIG.get("password_channel_id", 0))
 
 # ===================== GitHub Storage =====================
 API_BASE = "https://api.github.com"
@@ -51,7 +52,7 @@ def gh_headers():
 def gh_get_families():
     url = f"{API_BASE}/repos/{OWNER}/{REPO}/contents/{GITHUB_FAMILIES_PATH}"
     params = {"ref": GITHUB_BRANCH}
-    r = requests.get(url, headers=gh_headers(), params=params, timeout=20)
+    r = requests.get(url, headers=gh_headers(), params=params, timeout=25)
 
     if r.status_code == 404:
         empty = {}
@@ -84,13 +85,14 @@ def gh_put_families(families: dict, sha: str | None, message: str):
     if sha:
         payload["sha"] = sha
 
-    r = requests.put(url, headers=gh_headers(), json=payload, timeout=20)
+    r = requests.put(url, headers=gh_headers(), json=payload, timeout=25)
 
+    # SHA mismatch retry (rare)
     if r.status_code == 409:
         time.sleep(0.7)
         _, sha_now = gh_get_families()
         payload["sha"] = sha_now
-        r = requests.put(url, headers=gh_headers(), json=payload, timeout=20)
+        r = requests.put(url, headers=gh_headers(), json=payload, timeout=25)
 
     r.raise_for_status()
     return r.json()["content"]["sha"]
@@ -137,11 +139,9 @@ def make_nick(tag: str, first: str, last: str) -> str:
     return nick[:32]
 
 def get_tag_from_family_data(family_name: str, data: dict) -> str:
-    # fallback: if no tag stored, use family name (first 6 chars upper) or full family name
     tag = str(data.get("tag", "")).strip()
     if tag:
         return tag.upper()
-    # fallback: use family name as tag
     return family_name.strip().upper()[:6] or "TAG"
 
 # ===================== UI =====================
@@ -192,7 +192,6 @@ class VerifyModal(discord.ui.Modal, title="🧬 Rollenvergabe"):
 
         member = interaction.user
 
-        # ✅ Nickname: TAG | Vorname Nachname
         tag = get_tag_from_family_data(self.family_name, data)
         try:
             await member.edit(nick=make_nick(tag, self.ic_first.value, self.ic_last.value))
@@ -365,11 +364,11 @@ async def familie_change(interaction: discord.Interaction, user: discord.Member,
         await interaction.response.send_message("❌ Rolle konnte nicht vergeben werden (Hierarchie prüfen).", ephemeral=True)
         return
 
-    # Nickname: TAG | Vorname Nachname (nimmt vorhandenen Namen rechts vom |)
+    # Nickname: TAG | Vorname Nachname (behält rechten Teil wenn vorhanden)
     tag = str(fams[familie].get("tag", familie)).strip().upper()
     right = (user.nick or user.name)
     if "|" in right:
-        right = right.split("|", 1)[1].strip()  # alles nach dem Tag behalten
+        right = right.split("|", 1)[1].strip()
     try:
         await user.edit(nick=f"{tag} | {right}"[:32])
     except:
@@ -377,6 +376,39 @@ async def familie_change(interaction: discord.Interaction, user: discord.Member,
 
     await log(interaction.guild, f"🔄 familie_change: {interaction.user} → {user} => {familie} (TAG {tag})")
     await interaction.response.send_message(f"✅ {user.mention} ist jetzt **{familie}** (Tag **{tag}**).", ephemeral=True)
+
+@bot.tree.command(name="familien_passwoerter", description="Postet die Familienliste im Passwort-Channel (Staff)")
+async def familien_passwoerter(interaction: discord.Interaction, voll: bool = False):
+    if not is_staff(interaction.user):
+        return await interaction.response.send_message("❌ Keine Berechtigung.", ephemeral=True)
+
+    if not PASSWORD_CHANNEL_ID:
+        return await interaction.response.send_message("❌ password_channel_id fehlt in config.json", ephemeral=True)
+
+    ch = interaction.guild.get_channel(PASSWORD_CHANNEL_ID)
+    if not ch:
+        return await interaction.response.send_message("❌ Passwort-Channel nicht gefunden (ID falsch / Bot sieht ihn nicht).", ephemeral=True)
+
+    fams = load_families()
+    if not fams:
+        return await interaction.response.send_message("ℹ️ Keine Familien vorhanden.", ephemeral=True)
+
+    lines = []
+    for family_name, data in sorted(fams.items(), key=lambda x: x[0].lower()):
+        tag = str(data.get("tag", "")).strip().upper()
+        pw = str(data.get("password", "")).strip()
+        show_pw = pw if voll else ("*" * min(len(pw), 12) if pw else "-")
+        lines.append(f"🏴 **{family_name}** | Tag: **{tag or '-'}** | PW: `{show_pw}`")
+
+    embed = discord.Embed(
+        title="🔐 Familien-Passwörter (Staff)",
+        description="\n".join(lines)[:3900],
+        color=discord.Color.orange()
+    )
+    embed.set_footer(text="Nur für Staff — nicht leaken!")
+
+    await ch.send(embed=embed)
+    await interaction.response.send_message("✅ Liste wurde im Passwort-Channel gepostet.", ephemeral=True)
 
 @bot.tree.command(name="ui_update", description="UI neu posten/aktualisieren (Staff)")
 async def ui_update(interaction: discord.Interaction):
